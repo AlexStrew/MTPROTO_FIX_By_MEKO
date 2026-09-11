@@ -1031,40 +1031,9 @@ if [[ -n "$FLAG_TELEMT" || -n "$FLAG_ZIG" || -n "$FLAG_MTG" || -n "$FLAG_FIX" ||
         fi
         # Тип фикса (если не указан, спрашиваем)
         if [ -z "$FIX_TYPE" ]; then
-            echo "" >&2
-            echo -e "  ${BOLD}Выберите вариант фикса:${NC}" >&2
-            echo -e "  ${DIM}══════════════════════════════════════════════${NC}" >&2
-            echo "" >&2
-            echo -e "  ${YELLOW}[V2]${NC}  ${BOLD}v2 фикс iptables${NC} (TTL+Length) — разделение по TTL+Length" >&2
-            echo -e "${DIM}  Если TTL <65 и length 64 -> это ios и принимаем пакеты без лимита" >&2
-            echo -e "${DIM}  Иначе -> это другое ус-во и ставим SYN 1 пакет в 1.1 сек." >&2
-            echo "" >&2
-            echo -e "  ${GREEN}[V3]${NC}  ${BOLD}v3 фикс iptables${NC} (u32) — разделение по байтам из пакета — ${GREEN}рекомендуется${NC}" >&2
-            echo -e "${DIM}  Если совпало -> это ios и принимаем пакеты без лимита" >&2
-            echo -e "${DIM}  Если не совпало -> это другое ус-во и ставим SYN 1 пакет в 1.1 сек." >&2
-            echo "" >&2
-            echo -e "  ${CYAN}[V4]${NC}  ${BOLD}v4 фикс zapret2${NC} — быстрый (на этапе тестирования)" >&2
-            echo -e "${DIM}  Работает с помощью zapret2 на уровне TCP-пакетов:" >&2
-            echo -e "${DIM}  disorder + badsum + window control" >&2
-            echo "" >&2
-            echo -e "  ${GREEN}[nft]${NC}  ${BOLD}v3 фикс nftables${NC} — совместим с Docker" >&2
-            echo -e "${DIM}  Разделение по байтам из пакета, как в v3 iptables" >&2
-            echo -e "${DIM}  Если совпало -> это ios и принимаем пакеты без лимита" >&2
-            echo -e "${DIM}  Если не совпало -> это другое ус-во и ставим SYN 1 пакет в 1.1 сек." >&2
-            echo "" >&2
-            while true; do
-                echo -en "  ${NC}${BOLD}Ввод${GREEN}${BOLD} (v2/v3/v4/nft, Enter - v3)${NC}:${NC} " >&2
-                if [ -r /dev/tty ]; then
-                    read -r answer </dev/tty
-                else
-                    answer=""
-                fi
-                answer="${answer:-v3}"
-                case "$answer" in
-                    v2|v3|v4|nft) FIX_TYPE="$answer"; break ;;
-                    *) echo -e "  ${RED}Неверный ввод. Допустимо: v2, v3, v4, nft${NC}" >&2 ;;
-                esac
-            done
+            # В авто-режиме (переданы флаги) — дефолт v3 без вопросов
+            FIX_TYPE="v3"
+            log_info "Тип фикса не указан, используем v3 (рекомендуется)"
         fi
     fi
 
