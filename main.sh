@@ -54,11 +54,11 @@ ensure_rules_loaded() {
 
     log_warning "Файл $RULES_SCRIPT не найден, скачиваю с GitHub..."
     mkdir -p /opt/mtpr-simple/data
-    if curl -fsSL --max-time 5 "https://raw.githubusercontent.com/Mekotofeuka/MTPROTO_FIX_By_MEKO/main/data/rules.sh" -o "$RULES_SCRIPT"; then
+    if curl -fsSL --max-time 5 "https://raw.githubusercontent.com/AlexStrew/MTPROTO_FIX_By_MEKO/main/data/rules.sh" -o "$RULES_SCRIPT"; then
         chmod +x "$RULES_SCRIPT"
         source "$RULES_SCRIPT"
         RULES_LOADED=1
-        if curl -fsSL --max-time 5 "https://raw.githubusercontent.com/Mekotofeuka/MTPROTO_FIX_By_MEKO/main/data/zapret2_fix.sh" -o /opt/mtpr-simple/data/zapret2_fix.sh; then
+        if curl -fsSL --max-time 5 "https://raw.githubusercontent.com/AlexStrew/MTPROTO_FIX_By_MEKO/main/data/zapret2_fix.sh" -o /opt/mtpr-simple/data/zapret2_fix.sh; then
             chmod +x /opt/mtpr-simple/data/zapret2_fix.sh
             source /opt/mtpr-simple/data/zapret2_fix.sh
             zapret2_load_settings 2>/dev/null || true
@@ -1019,7 +1019,7 @@ main_menu() {
 
 # ── Обновление скрипта ──────────────────────────────────────────
 update_script() {
-    local BASE_URL="https://raw.githubusercontent.com/Mekotofeuka/MTPROTO_FIX_By_MEKO/main"
+    local BASE_URL="https://raw.githubusercontent.com/AlexStrew/MTPROTO_FIX_By_MEKO/main"
     local MANIFEST_URL="$BASE_URL/data/manifest.txt"
     local MANIFEST_FILE="/tmp/manifest_update.txt"
     local INSTALL_DIR="/opt/mtpr-simple"
@@ -1167,7 +1167,7 @@ update_script() {
 
 # ── Установка/обновление Node Manager ──────────────────────────
 install_node_manager() {
-    local BASE_URL="https://raw.githubusercontent.com/Mekotofeuka/MTPROTO_FIX_By_MEKO/main"
+    local BASE_URL="https://raw.githubusercontent.com/AlexStrew/MTPROTO_FIX_By_MEKO/main"
     local MANIFEST_URL="$BASE_URL/remote_ctl/manifest.txt"
     local MANIFEST_FILE="/tmp/node_manager_manifest.txt"
     local INSTALL_DIR="/opt/mtpr-simple/remote_ctl"
