@@ -1,0 +1,25 @@
+install_auto.sh|Авто-установщик
+
+install_main.sh|Полуавтоматический установщик
+
+install.sh|Главный файл установки 
+
+main.sh|Главное меню лаунчера
+
+proxys/proxymenu.sh|Меню выбора прокси
+
+data/rules.sh|Основной набор правил
+
+data/zapret2_fix.sh|Меню и настройки zapret2
+
+proxys/telemt1.sh|Меню Telemt
+
+proxys/telemt_panel_amirotin.sh|Меню упр панелью для Telemt от amirotin
+
+proxys/mtgv2_1.sh|Меню MTG
+
+proxys/mtprotozig1.sh|Меню MTProtoZig
+
+proxys/telemt_in_docker1.sh|Установка Telemt в Docker
+
+proxy_checker.py|Проверка SNI

@@ -1,0 +1,1020 @@
+#!/bin/bash
+# data/rules.sh – все функции и наборы для работы с SYN FIX (iptables/nftables)
+
+# ── Цвета ─────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+GRAY='\033[0;90m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ── Логирование ─────────────────────────────────────────────
+log_info() { echo -e "  ${BLUE}[i]${NC} $1"; }
+log_success() { echo -e "  ${GREEN}[✓]${NC} $1"; }
+log_error() { echo -e "  ${RED}[✗]${NC} $1" >&2; }
+log_warning() { echo -e "  ${YELLOW}[!]${NC} $1"; }
+
+# ── Файл для хранения порта ─────────────────────────────────
+PORT_FILE="/opt/mtpr-simple/port"
+
+# ── Название кастомной цепочки iptables ─────────────────────
+SYNFIX_CHAIN="MTPR_SYNFIX"
+
+# ── Все commonly used proxy ports (для режима "все порты") ───
+COMMON_PORTS="22,80,443,2053,2083,2087,2096,8080,8443,8888,9443,10443"
+
+# ── Функция получения списка прокси-портов (исключая SSH) ───
+get_proxy_ports() {
+    local ssh_port=$(get_ssh_port)
+    local ports="$COMMON_PORTS"
+    # Удаляем SSH порт из списка, если он там есть
+    ports=$(echo "$ports" | sed "s/,${ssh_port}\b//g; s/\b${ssh_port},//g; s/\b${ssh_port}//g")
+    # Убираем двойные запятые
+    ports=$(echo "$ports" | sed 's/,,/,/g; s/^,//; s/,$//')
+    echo "$ports"
+}
+
+# ── Функция обрезки пробелов ──────────────────────────────
+trim() {
+    local var="$1"
+    var="${var#"${var%%[![:space:]]*}"}"
+    var="${var%"${var##*[![:space:]]}"}"
+    printf '%s' "$var"
+}
+
+# ── Функция определения порта SSH ────────────────────────────
+get_ssh_port() {
+    local port
+    if command -v sshd >/dev/null 2>&1; then
+        port=$(timeout 3 sshd -T 2>/dev/null | grep '^port ' | awk '{print $2}' | head -1)
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo "$port"
+            return 0
+        fi
+    fi
+
+    if [ -f /etc/ssh/sshd_config ]; then
+        port=$(grep -E '^Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config | head -1 | awk '{print $2}')
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo "$port"
+            return 0
+        fi
+    fi
+
+    if [ -d /etc/ssh/sshd_config.d ]; then
+        for cfg in /etc/ssh/sshd_config.d/*.conf; do
+            if [ -f "$cfg" ]; then
+                port=$(grep -E '^Port[[:space:]]+[0-9]+' "$cfg" | head -1 | awk '{print $2}')
+                if [[ "$port" =~ ^[0-9]+$ ]]; then
+                    echo "$port"
+                    return 0
+                fi
+            fi
+        done
+    fi
+
+    echo "22"
+    return 0
+}
+
+save_port() {
+    echo "$1" >"$PORT_FILE"
+}
+
+# ── ПРОВЕРКА НАЛИЧИЯ ЦЕПОЧКИ IPTABLES SYN FIX ────────────────
+is_syn_fix_chain_installed() {
+    iptables -L "$SYNFIX_CHAIN" -n >/dev/null 2>&1
+}
+
+is_syn_fix_service_running() {
+    systemctl is-active --quiet mtpr-synfix.service
+}
+
+get_synfix_status() {
+    if is_syn_fix_chain_installed; then
+        if is_syn_fix_service_running; then
+            echo "active"
+        else
+            echo "has_chain_only"
+        fi
+    else
+        echo "inactive"
+    fi
+}
+
+# ── ПРОВЕРКА НАЛИЧИЯ NFTABLES SYN FIX ────────────────────────
+is_nft_fix_installed() {
+    nft list table inet mtpr_synfix &>/dev/null 2>&1
+}
+
+is_nft_fix_service_running() {
+    systemctl is-active --quiet mtpr-nft-synfix.service 2>/dev/null
+}
+
+get_nft_fix_status() {
+    if is_nft_fix_installed; then
+        if is_nft_fix_service_running; then
+            echo "active"
+        else
+            echo "has_table_only"
+        fi
+    else
+        echo "inactive"
+    fi
+}
+
+# ── Генерация скрипта применения правил ──────────────────────────
+generate_apply_script() {
+    local fix_type="${1:-new}"
+    shift
+    local ports=("$@")
+
+    if [ "$fix_type" = "old" ]; then
+        cat >/opt/mtpr-simple/apply-mtpr-synfix.sh <<'APPLY_SCRIPT_EOF'
+#!/bin/bash
+set -e
+
+# ── Парсим порты из файла ──────────────────────────────────
+if [ -f /opt/mtpr-simple/port ]; then
+    PORTS=$(cat /opt/mtpr-simple/port)
+else
+    echo "SYN FIX: Файл с портами не найден" >&2
+    exit 1
+fi
+
+CHAIN="MTPR_SYNFIX"
+SSH_PORT=$(sshd -T 2>/dev/null | grep '^port ' | awk '{print $2}' || echo 22)
+
+if ! iptables -C INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT 2>/dev/null; then
+    iptables -I INPUT 1 -p tcp --dport "$SSH_PORT" -j ACCEPT
+    echo "SSH-доступ (${SSH_PORT}) разрешён"
+fi
+
+iptables -t filter -N "$CHAIN" 2>/dev/null || true
+iptables -t filter -F "$CHAIN"
+
+if ! iptables -t filter -C INPUT -j "$CHAIN" 2>/dev/null; then
+    iptables -t filter -I INPUT 2 -j "$CHAIN"
+    echo "Цепочка $CHAIN подключена к INPUT"
+fi
+
+# ── РЕЖИМ "ВСЕ ПОРТЫ" ─────────────────────────────────────
+if [ "$PORTS" = "all" ]; then
+    # ── iOS — TTL+Length, ACCEPT БЕЗ ЛИМИТА — все порты ──────
+    iptables -t filter -A "$CHAIN" -p tcp --syn \
+        -m tcp --tcp-flags SYN SYN \
+        -m length --length 64 \
+        -m ttl --ttl-lt 65 \
+        -j ACCEPT
+
+    # ── hashlimit для всех остальных — все порты ─────────────
+    iptables -t filter -A "$CHAIN" -p tcp --syn \
+        -m hashlimit \
+        --hashlimit-name mtproto_all \
+        --hashlimit-mode srcip \
+        --hashlimit-upto 54/minute \
+        --hashlimit-burst 1 \
+        --hashlimit-htable-expire 60000 \
+        --hashlimit-htable-size 32768 \
+        -j ACCEPT
+
+    # ── REJECT для всех остальных ────────────────────────────
+    iptables -t filter -A "$CHAIN" -p tcp --syn \
+        -j REJECT --reject-with tcp-reset
+else
+# ── Проходим по каждому порту ──────────────────────────────
+IFS=',' read -ra PORT_ARRAY <<< "$PORTS"
+for PORT in "${PORT_ARRAY[@]}"; do
+    PORT=$(echo "$PORT" | xargs)
+    [ -z "$PORT" ] && continue
+
+    # ── iOS — проверка TTL+Length, ACCEPT БЕЗ ЛИМИТА ────────
+    iptables -t filter -A "$CHAIN" -p tcp --dport "$PORT" --syn \
+        -m tcp --tcp-flags SYN SYN \
+        -m length --length 64 \
+        -m ttl --ttl-lt 65 \
+        -j ACCEPT
+
+    # ── ВТОРОЙ СЛОЙ — все остальные → hashlimit 54/мин ──────
+    iptables -t filter -A "$CHAIN" -p tcp --dport "$PORT" --syn \
+        -m hashlimit \
+        --hashlimit-name mtproto_"$PORT" \
+        --hashlimit-mode srcip \
+        --hashlimit-upto 54/minute \
+        --hashlimit-burst 1 \
+        --hashlimit-htable-expire 60000 \
+        --hashlimit-htable-size 32768 \
+        -j ACCEPT
+
+    # ── REJECT для всех остальных ────────────────────────────
+    iptables -t filter -A "$CHAIN" -p tcp --dport "$PORT" --syn \
+        -j REJECT --reject-with tcp-reset
+done
+fi
+
+APPLY_SCRIPT_EOF
+    else
+        # Новый вариант (u32 + ACCEPT без лимита)
+        cat >/opt/mtpr-simple/apply-mtpr-synfix.sh <<'APPLY_SCRIPT_EOF'
+#!/bin/bash
+set -e
+
+# ── Парсим порты из файла ──────────────────────────────────
+if [ -f /opt/mtpr-simple/port ]; then
+    PORTS=$(cat /opt/mtpr-simple/port)
+else
+    echo "SYN FIX: Файл с портами не найден" >&2
+    exit 1
+fi
+
+CHAIN="MTPR_SYNFIX"
+SSH_PORT=$(sshd -T 2>/dev/null | grep '^port ' | awk '{print $2}' || echo 22)
+
+if ! iptables -C INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT 2>/dev/null; then
+    iptables -I INPUT 1 -p tcp --dport "$SSH_PORT" -j ACCEPT
+    echo "SSH-доступ (${SSH_PORT}) разрешён"
+fi
+
+iptables -t filter -N "$CHAIN" 2>/dev/null || true
+iptables -t filter -F "$CHAIN"
+
+if ! iptables -t filter -C INPUT -j "$CHAIN" 2>/dev/null; then
+    iptables -t filter -I INPUT 2 -j "$CHAIN"
+    echo "Цепочка $CHAIN подключена к INPUT"
+fi
+
+# ── 1. Маркировка iOS в mangle ──────────────────────────────
+iptables -t mangle -A PREROUTING -m u32 --u32 "32 & 0x000FFFFF = 0x0002FFFF && 40 & 0xFF000000 = 0x02000000 && 44 & 0xFFFF0000 = 0x01030000 && 48 & 0xFFFFFF00 = 0x01010800 && 60 & 0xFFFFFFFF = 0x04020000" -j MARK --set-mark 0x400
+
+# ── РЕЖИМ "ВСЕ ПОРТЫ" ─────────────────────────────────────
+if [ "$PORTS" = "all" ]; then
+    # ── ACCEPT для маркированных iOS — ВСЕ порты ─────────────
+    iptables -t filter -A "$CHAIN" -p tcp --syn -m mark --mark 0x400 -j ACCEPT
+
+    # ── hashlimit для всех остальных — ВСЕ порты ─────────────
+    iptables -t filter -A "$CHAIN" -p tcp --syn \
+        -m hashlimit \
+        --hashlimit-name mtproto_all \
+        --hashlimit-mode srcip \
+        --hashlimit-upto 54/minute \
+        --hashlimit-burst 1 \
+        --hashlimit-htable-expire 60000 \
+        --hashlimit-htable-size 32768 \
+        -j ACCEPT
+
+    # ── REJECT для всех остальных ────────────────────────────
+    iptables -t filter -A "$CHAIN" -p tcp --syn \
+        -j REJECT --reject-with tcp-reset
+else
+# ── Проходим по каждому порту ──────────────────────────────
+IFS=',' read -ra PORT_ARRAY <<< "$PORTS"
+for PORT in "${PORT_ARRAY[@]}"; do
+    PORT=$(echo "$PORT" | xargs)
+    [ -z "$PORT" ] && continue
+
+    # ── ACCEPT для маркированных iOS (БЕЗ ЛИМИТА) ─────────────
+    iptables -t filter -A "$CHAIN" -p tcp --dport "$PORT" --syn -m mark --mark 0x400 -j ACCEPT
+
+    # ── ВТОРОЙ СЛОЙ — все остальные → hashlimit 54/мин ──────
+    iptables -t filter -A "$CHAIN" -p tcp --dport "$PORT" --syn \
+        -m hashlimit \
+        --hashlimit-name mtproto_"$PORT" \
+        --hashlimit-mode srcip \
+        --hashlimit-upto 54/minute \
+        --hashlimit-burst 1 \
+        --hashlimit-htable-expire 60000 \
+        --hashlimit-htable-size 32768 \
+        -j ACCEPT
+
+    # ── REJECT для всех остальных ────────────────────────────
+    iptables -t filter -A "$CHAIN" -p tcp --dport "$PORT" --syn \
+        -j REJECT --reject-with tcp-reset
+done
+fi
+
+APPLY_SCRIPT_EOF
+    fi
+
+    chmod +x /opt/mtpr-simple/apply-mtpr-synfix.sh
+}
+
+# ── Генерация systemd юнита ────────────────────────────────────
+generate_service_unit() {
+    cat >/etc/systemd/system/mtpr-synfix.service <<'SERVICE_UNIT_EOF'
+[Unit]
+Description=MTProto SYN FIX rules for Telemt
+After=docker.service ufw.service network.target
+Wants=docker.service ufw.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/mtpr-simple/apply-mtpr-synfix.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_UNIT_EOF
+    if systemctl daemon-reload 2>/dev/null; then
+        log_info "Системный менеджер служб перезапущен"
+    fi
+}
+
+# ── УСТАНОВКА SYN FIX (с поддержкой аргументов) ────────────
+install_syn_fix() {
+    local ports_input
+    local fix_choice
+    local auto_install=false
+    local forced_ports=""
+    local FIX_TYPE="new"   # new=v3, old=v2, docker_smart=nft, zapret2
+
+    # ── Парсинг аргументов ──────────────────────────────────
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -auto_install)
+                auto_install=true
+                shift
+                ;;
+            -port)
+                forced_ports="$2"
+                shift 2
+                ;;
+            -type)
+                case "$2" in
+                    v2|old)   FIX_TYPE="old" ;;
+                    v3|new)   FIX_TYPE="new" ;;
+                    nft)      FIX_TYPE="docker_smart" ;;
+                    v4|zapret2) FIX_TYPE="zapret2" ;;
+                    *) log_warning "Неизвестный тип фикса: $2, используем v3"; FIX_TYPE="new" ;;
+                esac
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # ── Если auto_install и тип zapret2 – вызываем отдельную функцию ──
+    if [ "$auto_install" = true ] && [ "$FIX_TYPE" = "zapret2" ]; then
+        if [ -z "$forced_ports" ]; then
+            forced_ports="443"
+        fi
+        log_info "Установка Zapret2 (v4) на порт $forced_ports..."
+        # Вызываем функцию, которая будет реализована в zapret2_fix.sh
+        if declare -f zapret2_install_auto &>/dev/null; then
+            zapret2_install_auto "$forced_ports"
+            return $?
+        else
+            log_error "Функция zapret2_install_auto не найдена. Сначала обновите zapret2_fix.sh"
+            return 1
+        fi
+    fi
+
+    # ── Если auto_install и тип nft – вызываем установку nftables ──
+    if [ "$auto_install" = true ] && [ "$FIX_TYPE" = "docker_smart" ]; then
+        if [ -z "$forced_ports" ]; then
+            forced_ports="443"
+        fi
+        # Установка nftables в автоматическом режиме
+        install_nft_auto "$forced_ports"
+        return $?
+    fi
+
+    # ── Далее интерактивный режим или auto_install для v2/v3 ──
+
+    ssh_port=$(get_ssh_port)
+
+    if [ "$auto_install" = true ]; then
+        if [[ -n "$forced_ports" ]]; then
+            ports_input="$forced_ports"
+            log_info "Используем порты, переданные аргументом: $ports_input"
+        else
+            log_info "Порты не переданы, используем 443"
+            ports_input="443"
+        fi
+    else
+        echo ""
+        if [ -r /dev/tty ]; then
+            clear
+            echo -e ""
+            echo -e "  ${BOLD}Меню установки MTPRoto FIX V1.22"
+            echo -e "  ${DIM}═══════════════════════════════════════════════════════════════"
+            echo -e "  ${DIM}Для работы прокси на ios необходим корректно работающий домен"
+            echo -e "  ${DIM}Подробнее в data/dictionary.md в репозитории. (обязательно к прочтению)"
+            echo -e ""
+            echo -e "  ${NC}${BOLD}Введите порт для SYN FIX ${DIM}(Например: 443)"
+            echo -e "  ${NC}${BOLD}Либо введите порты через запятую ${DIM}(Например: 443,8443)"
+            echo -e "  ${CYAN}${BOLD}Либо введите ${GREEN}${BOLD}all${CYAN}${BOLD} для установки на ВСЕ порты (включая SSH)${NC}"
+            echo -e "  ${DIM}(Режим all обходит фриз-бан ТСПУ, применяя правила ко всем портам: 22,443,8080,8443 и др.)${NC}"
+            echo -e ""
+            echo -en "  ${NC}${BOLD}Ввод ${GREEN}${BOLD}(По умолчанию Enter - 443)${NC}${BOLD}:${NC}"
+            read -r ports_input </dev/tty
+        else
+            echo -e "  ${NC}${BOLD}Введите порт для SYN FIX ${DIM}(Например: 443)"
+            echo -e "  ${NC}${BOLD}Либо введите порты через запятую ${DIM}(Например: 443,8443)"
+            echo -e "  ${CYAN}${BOLD}Либо введите ${GREEN}${BOLD}all${CYAN}${BOLD} для установки на ВСЕ порты (включая SSH)${NC}"
+            echo -e "  ${DIM}(Режим all обходит фриз-бан ТСПУ, применяя правила ко всем портам: 22,443,8080,8443 и др.)${NC}"
+            echo -e ""
+            echo -en "  ${NC}${BOLD}Ввод ${GREEN}${BOLD}(По умолчанию Enter - 443)${NC}${BOLD}:${NC}"
+            read -r ports_input
+        fi
+        if [ -z "$ports_input" ]; then
+            ports_input="443"
+        fi
+
+        clear
+        echo ""
+        echo -e "  ${BOLD}Выберите вариант правил ниже"
+        echo -e "  ${DIM}══════════════════════════════════════════════"
+        echo ""
+        echo -e "  ${GREEN}[1]${NC}  ${BOLD}V3 фикс iptables${NC} (Разделение устройств с помощью u32 по байтам из пакета) — ${GREEN}${BOLD}рекомендуется (универсальный)${NC}"
+        echo -e "${DIM}  Если совпало -> это ios и принимаем пакеты без лимита"
+        echo -e "${DIM}  Если не совпало -> это другое ус-во и ставим SYN 1 пакет в 1.1 сек."
+        echo -e ""
+        echo -e "  ${CYAN}[2]${NC}  ${BOLD}V4 фикс zapret2 ${NC} — быстрый ${NC}"
+        echo -e "${DIM}  Работает с помощью zapret2 на уровне TCP-пакетов: ${NC}"
+        echo -e "${DIM}  disorder + badsum + window control"
+        echo ""
+        echo -e "  ${YELLOW}[3]${NC}  ${BOLD}v2 фикс iptables${NC} (Разделение устройств определяя их TTL+Length)"
+        echo -e "${DIM}  Если TTL <65 и length 64 -> это ios и принимаем пакеты без лимита"
+        echo -e "${DIM}  Иначе -> это другое ус-во и ставим SYN 1 пакет в 1.1 сек."
+        echo ""
+        echo -e "  ${GREEN}[4]${NC}  ${BOLD}v3 фикс nftables${GREEN}${BOLD} - рекомендуется (Совместим с Docker)${NC}"
+        echo -e "${DIM}  Если совпало -> это ios и принимаем пакеты без лимита"
+        echo -e "${DIM}  Если не совпало -> это другое ус-во и ставим SYN 1 пакет в 1.1 сек."
+        echo -e "  ${YELLOW}[5]${NC}  ${BOLD}v2 фикс nftables${NC}${BOLD}${NC}${BOLD} (Совместим с Docker)"
+        echo -e "${DIM}  Если TTL <65 и length 64 -> это ios и принимаем пакеты без лимита"
+        echo -e "${DIM}  Иначе -> это другое ус-во и ставим SYN 1 пакет в 1.1 сек."
+        echo ""
+        if [ -r /dev/tty ]; then
+            echo -en "  ${NC}${BOLD}Ввод (По умолчанию - ${GREEN}${BOLD}1 или enter${NC}${BOLD}):${NC} "
+            read -r fix_choice </dev/tty
+        else
+            echo -en "  ${NC}${BOLD}Ввод (${GREEN}${BOLD}По умолчанию - 1(Enter)${NC}${BOLD}):${NC} "
+            read -r fix_choice
+        fi
+
+        if [ -z "$fix_choice" ] || [ "$fix_choice" = "1" ]; then
+            FIX_TYPE="new"
+            log_info "Выбран v3 iptables"
+        elif [ "$fix_choice" = "2" ]; then
+            FIX_TYPE="zapret2"
+            log_info "Выбран Zapret2 fix"
+        elif [ "$fix_choice" = "3" ]; then
+            FIX_TYPE="old"
+            log_info "Выбран v2 iptables"
+        elif [ "$fix_choice" = "4" ]; then
+            FIX_TYPE="docker_smart"
+            log_info "Выбран v3 nftables"
+        elif [ "$fix_choice" = "5" ]; then
+            FIX_TYPE="docker_classic"
+            log_info "Выбран v2 nftables"
+        else
+            log_warning "Неверный выбор, используем первый вариант"
+            FIX_TYPE="new"
+        fi
+    fi
+
+    # ── Если выбран Zapret2 fix в интерактивном режиме ────────
+    if [ "$FIX_TYPE" = "zapret2" ]; then
+        if [ -f "/opt/mtpr-simple/data/zapret2_fix.sh" ]; then
+            source /opt/mtpr-simple/data/zapret2_fix.sh
+            show_zapret2_menu
+        else
+            log_error "zapret2_fix.sh не найден, скачиваю..."
+            mkdir -p /opt/mtpr-simple/data
+            curl -fsSL "https://raw.githubusercontent.com/Mekotofeuka/MTPROTO_FIX_By_MEKO/main/data/zapret2_fix.sh" -o /opt/mtpr-simple/data/zapret2_fix.sh
+            chmod +x /opt/mtpr-simple/data/zapret2_fix.sh
+            source /opt/mtpr-simple/data/zapret2_fix.sh
+            show_zapret2_menu
+        fi
+        return 0
+    fi
+
+    # ── Парсим порты ──────────────────────────────────────────
+    local ports_str=""
+
+    # Проверяем режим "все порты"
+    if [ "$(echo "$ports_input" | tr '[:upper:]' '[:lower:]')" = "all" ]; then
+        ports_str="all"
+        log_info "Режим: ВСЕ порты (включая SSH)"
+    else
+        IFS=',' read -ra PORTS_ARRAY <<< "$ports_input"
+        local valid_ports=()
+        for p in "${PORTS_ARRAY[@]}"; do
+            p=$(echo "$p" | xargs)
+            if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+                valid_ports+=("$p")
+            else
+                log_warning "Некорректный порт '$p' пропущен"
+            fi
+        done
+
+        if [ ${#valid_ports[@]} -eq 0 ]; then
+            log_error "Нет корректных портов для установки"
+            if [ "$auto_install" = false ] && [ -r /dev/tty ]; then
+                echo -e "  ${GRAY}Нажмите любую клавишу...${NC}"
+                read -rsn1 </dev/tty
+            fi
+            return 1
+        fi
+
+        ports_str=$(IFS=,; echo "${valid_ports[*]}")
+    fi
+
+    log_info "Установка SYN FIX на порты: $ports_str"
+    save_port "$ports_str"
+
+    # ── nftables режимы ──────────────────────────────────────
+    if [ "$FIX_TYPE" = "docker_smart" ] || [ "$FIX_TYPE" = "docker_classic" ]; then
+        # Проверяем nftables
+        if ! command -v nft &>/dev/null; then
+            log_warning "nftables не установлен, устанавливаю..."
+            if command -v apt-get &>/dev/null; then
+                apt-get update -qq && apt-get install -y -qq nftables
+            elif command -v yum &>/dev/null; then
+                yum install -y -q nftables
+            elif command -v dnf &>/dev/null; then
+                dnf install -y -q nftables
+            else
+                log_error "Не удалось установить nftables автоматически"
+                if [ "$auto_install" = false ] && [ -r /dev/tty ]; then
+                    echo -e "  ${GRAY}Нажмите любую клавишу${NC}"
+                    read -rsn1 </dev/tty
+                fi
+                return 1
+            fi
+        fi
+
+        if [ "$auto_install" = false ]; then
+            echo ""
+            if [ "$ports_str" = "all" ]; then
+                log_warning "Будет выполнена установка SYN FIX (nftables) на ВСЕ порты (включая SSH)"
+            else
+                log_warning "Будет выполнена установка SYN FIX (nftables) на порты: $ports_str"
+            fi
+            echo ""
+            echo -e "  ${BOLD}Что будет сделано:${NC}"
+            echo -e "  • Будет создана таблица nftables ${CYAN}mtpr_synfix${NC}"
+            echo -e "  • Добавлены правила SYN-фильтрации для портов: ${CYAN}$ports_str${NC}"
+            echo -e "  • Будет создан systemd сервис ${CYAN}mtpr-nft-synfix.service${NC}"
+            echo ""
+            log_warning "${BOLD}ВНИМАНИЕ:${NC} Данная настройка изменит файрвол системы."
+            echo ""
+            if [ -r /dev/tty ]; then
+                echo -en "  ${BOLD}Продолжить установку? Y/n:${NC} "
+                read -r confirm </dev/tty
+            else
+                echo -en "  ${BOLD}Продолжить установку? Y/n:${NC} "
+                read -r confirm
+            fi
+            if [[ -z "$confirm" || "$confirm" =~ ^[yY]$ ]]; then
+                : # продолжить
+            else
+                log_info "Установка отменена"
+                sleep 0.5
+                return 1
+            fi
+        fi
+
+        log_info "Установка nftables режима..."
+
+        local NFT_SCRIPT="/opt/mtpr-simple/mtpr-synfix-nft.sh"
+        local NFT_TABLE="mtpr_synfix"
+
+        cat > "$NFT_SCRIPT" << 'NFT_WRAPPER_EOF'
+#!/bin/sh
+set -eu
+
+TABLE="mtpr_synfix"
+CHAIN="input"
+
+nft delete table inet "$TABLE" 2>/dev/null || true
+nft add table inet "$TABLE"
+nft "add chain inet $TABLE $CHAIN { type filter hook input priority 0; policy accept; }"
+
+NFT_WRAPPER_EOF
+
+        # ── Режим "все порты": генерируем правила для каждого порта ──
+        if [ "$ports_str" = "all" ]; then
+            IFS=',' read -ra ALL_PORTS <<< "$COMMON_PORTS"
+            for p in "${ALL_PORTS[@]}"; do
+                p=$(echo "$p" | xargs)
+                if [[ "$p" =~ ^[0-9]+$ ]]; then
+                    if [ "$FIX_TYPE" = "docker_smart" ]; then
+                        cat >> "$NFT_SCRIPT" << SMART_ALL_EOF
+nft "add rule inet mtpr_synfix input tcp dport ${p} tcp flags & (syn|ack) == syn @th,108,20 0x2ffff @th,160,16 0x204 @th,192,16 0x103 @th,224,24 0x10108 @th,320,32 0x4020000 counter accept comment \"ios_accept_${p}\""
+nft "add rule inet mtpr_synfix input tcp dport ${p} tcp flags & (syn|ack) == syn meter mtpr_other_${p} { ip saddr timeout 60s limit rate 54/minute burst 1 packets } counter accept comment \"other_accept_${p}\""
+nft "add rule inet mtpr_synfix input tcp dport ${p} tcp flags & (syn|ack) == syn counter reject with icmp type host-unreachable comment \"other_reject_${p}\""
+SMART_ALL_EOF
+                    else
+                        cat >> "$NFT_SCRIPT" << CLASSIC_ALL_EOF
+nft "add rule inet mtpr_synfix input tcp dport ${p} tcp flags & (syn|ack) == syn meter mtpr_classic_${p} { ip saddr timeout 60s limit rate 1/second burst 1 packets } counter drop comment \"classic_drop_${p}\""
+CLASSIC_ALL_EOF
+                    fi
+                fi
+            done
+        else
+            # Добавляем шаблон и заменяем PORT_HERE на конкретные порты
+            if [ "$FIX_TYPE" = "docker_smart" ]; then
+                cat >> "$NFT_SCRIPT" << 'SMART_RULES_EOF'
+nft "add rule inet mtpr_synfix input tcp dport PORT_HERE tcp flags & (syn|ack) == syn @th,108,20 0x2ffff @th,160,16 0x204 @th,192,16 0x103 @th,224,24 0x10108 @th,320,32 0x4020000 counter accept comment \"ios_accept\""
+nft "add rule inet mtpr_synfix input tcp dport PORT_HERE tcp flags & (syn|ack) == syn meter mtpr_other { ip saddr timeout 60s limit rate 54/minute burst 1 packets } counter accept comment \"other_accept\""
+nft "add rule inet mtpr_synfix input tcp dport PORT_HERE tcp flags & (syn|ack) == syn counter reject with icmp type host-unreachable comment \"other_reject\""
+SMART_RULES_EOF
+            else
+                cat >> "$NFT_SCRIPT" << 'CLASSIC_RULES_EOF'
+nft "add rule inet mtpr_synfix input tcp dport PORT_HERE tcp flags & (syn|ack) == syn meter mtpr_classic { ip saddr timeout 60s limit rate 1/second burst 1 packets } counter drop comment \"classic_drop\""
+CLASSIC_RULES_EOF
+            fi
+            for port in "${valid_ports[@]}"; do
+                sed -i "s/PORT_HERE/${port}/g" "$NFT_SCRIPT"
+            done
+        fi
+
+        chmod +x "$NFT_SCRIPT"
+
+        if /bin/sh "$NFT_SCRIPT"; then
+            log_success "NFT правила применены успешно"
+        else
+            log_error "Ошибка применения NFT правил"
+            if [ "$auto_install" = false ] && [ -r /dev/tty ]; then
+                echo -e "  ${GRAY}Нажмите любую клавишу${NC}"
+                read -rsn1 </dev/tty
+            fi
+            return 1
+        fi
+
+        cat > /etc/systemd/system/mtpr-nft-synfix.service << 'SERVICE_NFT_EOF'
+[Unit]
+Description=MTProto SYN FIX (nftables) for Telemt/Docker
+After=docker.service network.target
+Wants=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /opt/mtpr-simple/mtpr-synfix-nft.sh
+ExecStop=/bin/sh -c '/usr/sbin/nft delete table inet mtpr_synfix 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_NFT_EOF
+
+        systemctl daemon-reload
+        systemctl enable mtpr-nft-synfix.service 2>/dev/null
+        systemctl restart mtpr-nft-synfix.service 2>/dev/null
+
+        log_success "SYN FIX (nftables) успешно установлен на порты: $ports_str"
+        if [ "$auto_install" = false ] && [ -r /dev/tty ]; then
+            echo -e "  ${GRAY}Нажмите любую клавишу${NC}"
+            read -rsn1 </dev/tty
+        fi
+        return 0
+    fi
+
+    # ── iptables режимы (v2 и v3) ──────────────────────────
+    if [ "$auto_install" = false ]; then
+        echo ""
+        if [ "$ports_str" = "all" ]; then
+            log_warning "Будет выполнена установка SYN FIX на ВСЕ порты (включая SSH)"
+            echo ""
+            echo -e "  ${BOLD}Что будет сделано:${NC}"
+            echo -e "  • Создана отдельная цепочка iptables ${CYAN}$SYNFIX_CHAIN${NC}"
+            echo -e "  • Добавлены правила SYN-фильтрации для ${GREEN}${BOLD}ВСЕХ портов${NC} (включая SSH)"
+            echo -e "  • Порты: ${CYAN}22, 80, 443, 8080, 8443, 8888, 9443, 10443 и др.${NC}"
+            echo -e "  • Вы сможете удалить данную настройку через меню скрипта."
+        else
+            log_warning "Будет выполнена установка SYN FIX на порты: $ports_str"
+            echo ""
+            echo -e "  ${BOLD}Что будет сделано:${NC}"
+            echo -e "  • Создана отдельная цепочка iptables ${CYAN}$SYNFIX_CHAIN${NC}"
+            echo -e "  • Добавлены правила SYN-фильтрации для портов: ${CYAN}$ports_str${NC}"
+            echo -e "  • Вы сможете удалить данную настройку через меню скрипта."
+        fi
+        echo ""
+        log_warning "${BOLD}ВНИМАНИЕ:${NC} Данная настройка изменит файрвол системы."
+        echo ""
+        if [ -r /dev/tty ]; then
+            echo -en "  ${BOLD}Продолжить установку? [Y/n]:${NC} "
+            read -r confirm </dev/tty
+        else
+            echo -en "  ${BOLD}Продолжить установку? [Y/n]:${NC} "
+            read -r confirm
+        fi
+        if [[ -z "$confirm" || "$confirm" =~ ^[yY]$ ]]; then
+            : # продолжить
+        else
+            log_info "Установка отменена"
+            sleep 0.5
+            return 1
+        fi
+    fi
+
+    generate_apply_script "$FIX_TYPE" "${valid_ports[@]}"
+    generate_service_unit
+    systemctl daemon-reload
+
+    local apply_output
+    local apply_exit_code
+    apply_output=$(PORT="$ports_str" /opt/mtpr-simple/apply-mtpr-synfix.sh 2>&1)
+    apply_exit_code=$?
+
+    if [ "$FIX_TYPE" = "new" ] && [ $apply_exit_code -ne 0 ] && echo "$apply_output" | grep -q "u32"; then
+        if [ "$auto_install" = false ]; then
+            echo ""
+            echo -e "  ${YELLOW}[!]${NC} Обнаружена ошибка: модуль u32 отсутствует"
+            echo -e "  ${YELLOW}[!]${NC} Для работы нового варианта SYN FIX требуется установить модуль xt_u32"
+            echo ""
+            echo -e "  ${BOLD}Установить необходимый модуль xt_u32?${NC}"
+            echo -e "  ${GREEN}Enter/Y${NC} — установить и продолжить"
+            echo -e "  ${RED}N/n${NC} — отменить установку и вернуться в меню"
+            echo ""
+            if [ -r /dev/tty ]; then
+                echo -en "  ${BOLD}Ввод:${NC} "
+                read -r install_u32 </dev/tty
+            else
+                echo -en "  ${BOLD}Ввод:${NC} "
+                read -r install_u32
+            fi
+
+            if [[ -z "$install_u32" || "$install_u32" =~ ^[yY]$ ]]; then
+                echo ""
+                log_info "Установка модуля xt_u32 для AlmaLinux..."
+                echo ""
+                
+                local ALMA_VERSION=""
+                if [ -f /etc/almalinux-release ]; then
+                    ALMA_VERSION=$(grep -oE '[0-9]+' /etc/almalinux-release | head -1)
+                elif [ -f /etc/os-release ]; then
+                    ALMA_VERSION=$(grep -E '^VERSION_ID=' /etc/os-release | cut -d'"' -f2 | cut -d'.' -f1)
+                fi
+                
+                if [ -z "$ALMA_VERSION" ]; then
+                    ALMA_VERSION="9"
+                    echo -e "  ${YELLOW}[!]${NC} Не удалось определить версию AlmaLinux, используем 9"
+                fi
+                
+                echo -e "  ${BLUE}[i]${NC} Обнаружена версия AlmaLinux: ${ALMA_VERSION}"
+                echo ""
+                
+                local ELREPO_URL=""
+                if [ "$ALMA_VERSION" = "10" ]; then
+                    ELREPO_URL="https://www.elrepo.org/elrepo-release-10.el10.elrepo.noarch.rpm"
+                else
+                    ELREPO_URL="https://www.elrepo.org/elrepo-release-9.el9.elrepo.noarch.rpm"
+                fi
+                
+                echo -e "  ${BLUE}[i]${NC} Добавление репозитория elrepo (версия ${ALMA_VERSION})..."
+                if sudo dnf install -y "$ELREPO_URL" 2>&1; then
+                    echo -e "  ${GREEN}[✓]${NC} Репозиторий elrepo добавлен"
+                else
+                    echo -e "  ${RED}[✗]${NC} Не удалось добавить репозиторий elrepo"
+                    if [ -r /dev/tty ]; then
+                        echo -e "  ${GRAY}Нажмите любую клавишу${NC}"
+                        read -rsn1 </dev/tty
+                    fi
+                    return 1
+                fi
+                
+                echo ""
+                echo -e "  ${BLUE}[i]${NC} Установка модуля kmod-xt_u32..."
+                if sudo dnf install -y kmod-xt_u32 2>&1; then
+                    echo -e "  ${GREEN}[✓]${NC} Модуль kmod-xt_u32 успешно установлен"
+                    echo ""
+                    log_info "Повторная попытка применения правил..."
+                    echo ""
+                    
+                    PORT="$ports_str" /opt/mtpr-simple/apply-mtpr-synfix.sh
+                    systemctl enable mtpr-synfix.service
+                    systemctl restart mtpr-synfix.service
+                    
+                    log_success "SYN FIX успешно установлен на порты: $ports_str"
+                    if [ -r /dev/tty ]; then
+                        echo -e "  ${GRAY}Нажмите любую клавишу${NC}"
+                        read -rsn1 </dev/tty
+                    fi
+                else
+                    echo -e "  ${RED}[✗]${NC} Не удалось установить модуль kmod-xt_u32"
+                    echo -e "  ${YELLOW}[!]${NC} Попробуйте выбрать старый вариант фикса (TTL+Length)"
+                    if [ -r /dev/tty ]; then
+                        echo -e "  ${GRAY}Нажмите любую клавишу${NC}"
+                        read -rsn1 </dev/tty
+                    fi
+                    return 1
+                fi
+            else
+                log_info "Установка отменена"
+                if [ -r /dev/tty ]; then
+                    echo -e "  ${GRAY}Нажмите любую клавишу...${NC}"
+                    read -rsn1 </dev/tty
+                fi
+                return 1
+            fi
+        else
+            # Автоматический режим: просто выводим ошибку и выходим
+            log_error "Модуль u32 отсутствует. Для автоматической установки требуется xt_u32."
+            return 1
+        fi
+    elif [ $apply_exit_code -ne 0 ]; then
+        log_error "Ошибка применения правил iptables:"
+        echo "$apply_output"
+        if [ "$auto_install" = false ] && [ -r /dev/tty ]; then
+            echo -e "  ${GRAY}Нажмите любую клавишу...${NC}"
+            read -rsn1 </dev/tty
+        fi
+        return 1
+    else
+        systemctl enable mtpr-synfix.service
+        systemctl restart mtpr-synfix.service
+        log_success "SYN FIX успешно установлен на порты: $ports_str"
+        if [ "$auto_install" = false ] && [ -r /dev/tty ]; then
+            echo -e "  ${GRAY}Нажмите любую клавишу...${NC}"
+            read -rsn1 </dev/tty
+        fi
+    fi
+}
+
+# ── Функция автоматической установки nftables ──────────────
+install_nft_auto() {
+    local ports_input="$1"
+    local ports_str_clean=""
+
+    # Проверяем режим "все порты"
+    if [ "$(echo "$ports_input" | tr '[:upper:]' '[:lower:]')" = "all" ]; then
+        ports_str_clean="all"
+        log_info "Режим: ВСЕ порты (включая SSH)"
+    else
+        IFS=',' read -ra PORTS_ARRAY <<< "$ports_input"
+        local valid_ports=()
+        for p in "${PORTS_ARRAY[@]}"; do
+            p=$(echo "$p" | xargs)
+            if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+                valid_ports+=("$p")
+            fi
+        done
+        if [ ${#valid_ports[@]} -eq 0 ]; then
+            log_error "Нет корректных портов"
+            return 1
+        fi
+        ports_str_clean=$(IFS=,; echo "${valid_ports[*]}")
+    fi
+
+    save_port "$ports_str_clean"
+
+    # Проверяем nftables
+    if ! command -v nft &>/dev/null; then
+        log_warning "nftables не установлен, устанавливаю..."
+        if command -v apt-get &>/dev/null; then
+            apt-get update -qq && apt-get install -y -qq nftables
+        elif command -v yum &>/dev/null; then
+            yum install -y -q nftables
+        elif command -v dnf &>/dev/null; then
+            dnf install -y -q nftables
+        else
+            log_error "Не удалось установить nftables автоматически"
+            return 1
+        fi
+    fi
+
+    local NFT_SCRIPT="/opt/mtpr-simple/mtpr-synfix-nft.sh"
+    cat > "$NFT_SCRIPT" << 'NFT_WRAPPER_EOF'
+#!/bin/sh
+set -eu
+
+TABLE="mtpr_synfix"
+CHAIN="input"
+
+nft delete table inet "$TABLE" 2>/dev/null || true
+nft add table inet "$TABLE"
+nft "add chain inet $TABLE $CHAIN { type filter hook input priority 0; policy accept; }"
+
+NFT_WRAPPER_EOF
+
+    if [ "$ports_str_clean" = "all" ]; then
+        # Режим "все порты": генерируем правила для каждого порта
+        IFS=',' read -ra ALL_PORTS <<< "$COMMON_PORTS"
+        for p in "${ALL_PORTS[@]}"; do
+            p=$(echo "$p" | xargs)
+            if [[ "$p" =~ ^[0-9]+$ ]]; then
+                cat >> "$NFT_SCRIPT" << SMART_ALL_EOF
+nft "add rule inet mtpr_synfix input tcp dport ${p} tcp flags & (syn|ack) == syn @th,108,20 0x2ffff @th,160,16 0x204 @th,192,16 0x103 @th,224,24 0x10108 @th,320,32 0x4020000 counter accept comment \"ios_accept_${p}\""
+nft "add rule inet mtpr_synfix input tcp dport ${p} tcp flags & (syn|ack) == syn meter mtpr_other_${p} { ip saddr timeout 60s limit rate 54/minute burst 1 packets } counter accept comment \"other_accept_${p}\""
+nft "add rule inet mtpr_synfix input tcp dport ${p} tcp flags & (syn|ack) == syn counter reject with icmp type host-unreachable comment \"other_reject_${p}\""
+SMART_ALL_EOF
+            fi
+        done
+    else
+        cat >> "$NFT_SCRIPT" << 'SMART_RULES_EOF'
+nft "add rule inet mtpr_synfix input tcp dport PORT_HERE tcp flags & (syn|ack) == syn @th,108,20 0x2ffff @th,160,16 0x204 @th,192,16 0x103 @th,224,24 0x10108 @th,320,32 0x4020000 counter accept comment \"ios_accept\""
+nft "add rule inet mtpr_synfix input tcp dport PORT_HERE tcp flags & (syn|ack) == syn meter mtpr_other { ip saddr timeout 60s limit rate 54/minute burst 1 packets } counter accept comment \"other_accept\""
+nft "add rule inet mtpr_synfix input tcp dport PORT_HERE tcp flags & (syn|ack) == syn counter reject with icmp type host-unreachable comment \"other_reject\""
+SMART_RULES_EOF
+
+        IFS=',' read -ra PORTS_ARRAY <<< "$ports_str_clean"
+        for port in "${PORTS_ARRAY[@]}"; do
+            port=$(echo "$port" | xargs)
+            sed -i "s/PORT_HERE/${port}/g" "$NFT_SCRIPT"
+        done
+    fi
+
+    chmod +x "$NFT_SCRIPT"
+
+    if /bin/sh "$NFT_SCRIPT"; then
+        log_success "NFT правила применены успешно"
+    else
+        log_error "Ошибка применения NFT правил"
+        return 1
+    fi
+
+    cat > /etc/systemd/system/mtpr-nft-synfix.service << 'SERVICE_NFT_EOF'
+[Unit]
+Description=MTProto SYN FIX (nftables) for Telemt/Docker
+After=docker.service network.target
+Wants=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /opt/mtpr-simple/mtpr-synfix-nft.sh
+ExecStop=/bin/sh -c '/usr/sbin/nft delete table inet mtpr_synfix 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_NFT_EOF
+
+    systemctl daemon-reload
+    systemctl enable mtpr-nft-synfix.service 2>/dev/null
+    systemctl restart mtpr-nft-synfix.service 2>/dev/null
+
+    log_success "SYN FIX (nftables) успешно установлен на порты: $ports_str_clean"
+    return 0
+}
+
+# ── УДАЛЕНИЕ SYN FIX ─────────────────────────────────────────
+remove_syn_fix() {
+    log_info "Удаление SYN FIX..."
+
+    systemctl stop mtpr-synfix.service 2>/dev/null || true
+    systemctl disable mtpr-synfix.service 2>/dev/null || true
+
+    if iptables -C INPUT -j "$SYNFIX_CHAIN" 2>/dev/null; then
+        iptables -D INPUT -j "$SYNFIX_CHAIN"
+        log_info "Цепочка $SYNFIX_CHAIN отключена от INPUT"
+    fi
+
+    if iptables -L "$SYNFIX_CHAIN" -n >/dev/null 2>&1; then
+        iptables -F "$SYNFIX_CHAIN"
+        iptables -X "$SYNFIX_CHAIN"
+        log_info "Цепочка $SYNFIX_CHAIN удалена"
+    fi
+
+    local u32_filter="32 & 0x000FFFFF = 0x0002FFFF && 40 & 0xFF000000 = 0x02000000 && 44 & 0xFFFF0000 = 0x01030000 && 48 & 0xFFFFFF00 = 0x01010800 && 60 & 0xFFFFFFFF = 0x04020000"
+    
+    if iptables -t mangle -L PREROUTING -n 2>/dev/null | grep -q "$u32_filter"; then
+        log_info "Обнаружены правила u32 в mangle (iptables), удаляем..."
+        iptables -t mangle -L PREROUTING --line-numbers 2>/dev/null | grep "$u32_filter" | awk '{print $1}' | tac | while read -r num; do
+            if [ -n "$num" ]; then
+                iptables -t mangle -D PREROUTING "$num" 2>/dev/null && log_info "Удалено правило u32 (номер $num)"
+            fi
+        done
+    else
+        log_info "Правил с нашим u32-фильтром в iptables/mangle не найдено"
+    fi
+
+    if command -v nft >/dev/null 2>&1; then
+        if nft list table inet mtpr_synfix &>/dev/null; then
+            log_info "Обнаружена таблица inet mtpr_synfix (nftables), удаляем..."
+            nft delete table inet mtpr_synfix 2>/dev/null && log_info "Таблица inet mtpr_synfix удалена"
+        else
+            log_info "Таблицы inet mtpr_synfix не найдено"
+        fi
+
+        handles=$(nft -a list chain ip mangle PREROUTING 2>/dev/null | grep 'xt match "u32".*meta mark set 0x400' | grep -o 'handle [0-9]*' | awk '{print $2}') || true
+        if [ -n "$handles" ]; then
+            log_info "Найдены правила u32 в nftables (ip mangle), удаляем..."
+            for h in $handles; do
+                nft delete rule ip mangle PREROUTING handle "$h" 2>/dev/null && log_info "Удалено правило u32 через nftables (handle $h)"
+            done
+        fi
+
+        nft delete table inet mtpr_synfix 2>/dev/null || true
+    fi
+
+    rm -f "$PORT_FILE"
+    rm -f /etc/systemd/system/mtpr-synfix.service
+
+    systemctl stop mtpr-nft-synfix.service 2>/dev/null || true
+    systemctl disable mtpr-nft-synfix.service 2>/dev/null || true
+    rm -f /etc/systemd/system/mtpr-nft-synfix.service
+    rm -f /opt/mtpr-simple/mtpr-synfix-nft.sh
+
+    systemctl daemon-reload
+
+    log_success "SYN FIX (iptables + nftables) удалён"
+}
